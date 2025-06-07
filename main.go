@@ -1,37 +1,77 @@
 package main
 
 import (
+	"chirpy/internal/database"
+	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync/atomic"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/joho/godotenv"
+	_ "github.com/lib/pq"
 )
 
 type apiConfig struct{
 	fileServerHits atomic.Int32
+	db *database.Queries
+	platform string
 }
 
 type chirp struct {
-	Body string `json:"body"`
+	ID		  uuid.UUID `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Body      string    `json:"body"`
+	UserId    uuid.UUID `json:"user_id"`
+}
+
+type user struct {
+	ID        uuid.UUID `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Email     string    `json:"email"`
 }
 
 func main() {
-	cfg := apiConfig{}
-	mux := http.NewServeMux()
+	godotenv.Load()
+	dbURL := os.Getenv("DB_URL")
+	if dbURL == "" {
+		log.Fatal("DB_URL must be set")
+	}
 
+	dbConn, err := sql.Open("postgres", dbURL)
+	if err != nil {
+		log.Fatalf("Error opening database: %s", err)
+	}
+
+	pltfrm := os.Getenv("PLATFORM")
+	dbQueries := database.New(dbConn)
+	cfg := apiConfig{
+		fileServerHits: atomic.Int32{},
+		db: dbQueries,
+		platform: pltfrm,
+	}
+
+	mux := http.NewServeMux()
 	mux.Handle("/app/", cfg.middlewareMetricsInc(http.StripPrefix("/app/", http.FileServer(http.Dir(".")))))
 	mux.HandleFunc("GET /api/healthz", healthzHandler)
 	mux.HandleFunc("GET /admin/metrics", cfg.getMetricsHandler)
 	mux.HandleFunc("POST /admin/reset", cfg.resetMetricsHandler)
-	mux.HandleFunc("POST /api/validate_chirp", validateChirp)
+	mux.HandleFunc("POST /api/users", cfg.createUsers)
+	mux.HandleFunc("POST /api/chirps", cfg.createChirps)
 
 	server := http.Server{
 		Addr: ":8080",
 		Handler: mux,
 	}
 
-	err := server.ListenAndServe()
+	err = server.ListenAndServe()
 	if err != nil {
 		fmt.Println("Server error: ", err)
 	}
@@ -62,45 +102,83 @@ func (cfg *apiConfig) getMetricsHandler(w http.ResponseWriter, req *http.Request
 
 //reset handler: resets the counter 
 func (cfg *apiConfig) resetMetricsHandler(w http.ResponseWriter, req *http.Request) {
+	if cfg.platform != "dev" {
+		w.WriteHeader(403)
+		w.Write([]byte("Cannot reset metrics and users from a non-dev platform"))
+	}
+
 	cfg.fileServerHits.Store(0)
+	cfg.db.DeleteUsers(req.Context())
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.Write([]byte("Metrics reset to 0"))
+	w.Write([]byte("Metrics reset to 0 & all users deleted"))
 }
 
-
-//validate handler: validates the chirps 
-func validateChirp(w http.ResponseWriter, req *http.Request) {
+// user create handler: creates a user in the db 
+func (cfg *apiConfig) createUsers(w http.ResponseWriter, req *http.Request) {
 	decoder := json.NewDecoder(req.Body)
-	reqChirp := chirp{}
-	err := decoder.Decode(&reqChirp)
+	usr := user{}
+	err := decoder.Decode(&usr)
 
 	if err != nil {
 		w.WriteHeader(500)
 		w.Write([]byte("{\"error\": \"Something went wrong\"}"))
-	} else if len(reqChirp.Body) > 140 {
-		w.WriteHeader(400)
-		w.Write([]byte("{\"error\": \"Chirp is too long\"}"))
-	} else if hasProfanity(reqChirp.Body){
-		cleaned_chirp := cleanProfanity(reqChirp.Body)
-		w.WriteHeader(200)
-		w.Write([]byte(fmt.Sprintf("{\"cleaned_body\": \"%s\"}", cleaned_chirp)))
 	} else {
-		w.WriteHeader(200)
-		w.Write([]byte(fmt.Sprintf("{\"cleaned_body\": \"%s\"}", reqChirp.Body)))
+		userDb, _ := cfg.db.CreateUser(req.Context(), usr.Email)
+		userRes := user(userDb)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(201)
+		res, _ := json.Marshal(userRes)
+		w.Write(res)
 	}
 }
 
-func hasProfanity(text string) bool {
-	words := strings.Fields(text)
-	for _, word := range words {
-		if strings.ToLower(word) == "kerfuffle" || strings.ToLower(word) == "sharbert" || strings.ToLower(word) == "fornax" {
-			return true
+// chirp create handler: creates a chirp in the db 
+func (cfg *apiConfig) createChirps(w http.ResponseWriter, req *http.Request) {
+	decoder := json.NewDecoder(req.Body)
+	chrp := chirp{}
+	err := decoder.Decode(&chrp)
+
+	if err != nil {
+		w.WriteHeader(500)
+		w.Write([]byte("{\"error\": \"Something went wrong\"}"))
+	} else if len(chrp.Body) > 140 {
+		w.WriteHeader(400)
+		w.Write([]byte("{\"error\": \"Chirp is too long\"}"))
+	} else {
+		chrp.Body = cleanProfanity(chrp.Body)
+
+		chirpParams := database.CreateChirpParams{
+			Body: chrp.Body,
+			UserID: chrp.UserId,
 		}
-	}
-	return false
+
+		chirpDb, err := cfg.db.CreateChirp(req.Context(), chirpParams)
+		if err != nil {
+			log.Printf("CreateChirp error: %v", err)
+			http.Error(w, `{"error": "Could not create chirp"}`, http.StatusInternalServerError)
+			return
+		}
+	
+		chirpRes := chirp{
+			ID:        chirpDb.ID,
+			CreatedAt: chirpDb.CreatedAt,
+			UpdatedAt: chirpDb.UpdatedAt,
+			Body:      chirpDb.Body,
+			UserId:    chirpDb.UserID, 
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(201)
+		res, _ := json.Marshal(chirpRes)
+		w.Write(res)
+	}	
 }
 
 func cleanProfanity(text string) string {
+	if !hasProfanity(text) {
+		return text
+	}
+
 	cleaned_chirp := ""
 	words := strings.Fields(text)
 	for _, word := range words {
@@ -111,4 +189,14 @@ func cleanProfanity(text string) string {
 		}
 	}
 	return cleaned_chirp[:len(cleaned_chirp)-1]
+}
+
+func hasProfanity(text string) bool {
+	words := strings.Fields(text)
+	for _, word := range words {
+		if strings.ToLower(word) == "kerfuffle" || strings.ToLower(word) == "sharbert" || strings.ToLower(word) == "fornax" {
+			return true
+		}
+	}
+	return false
 }
