@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+	"chirpy/internal/auth"
 
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
@@ -21,6 +22,7 @@ type apiConfig struct{
 	fileServerHits atomic.Int32
 	db *database.Queries
 	platform string
+	secret string
 }
 
 type chirp struct {
@@ -32,10 +34,21 @@ type chirp struct {
 }
 
 type user struct {
+	ID              uuid.UUID     `json:"id"`
+	CreatedAt       time.Time     `json:"created_at"`
+	UpdatedAt       time.Time     `json:"updated_at"`
+	Email           string        `json:"email"`
+	Password        string        `json:"password"`
+	HashedPassword  string        `json:"hashed_password"`
+	ExpiresInSecond time.Duration `json:"expires_in_second"`
+}
+
+type userResponse struct {
 	ID        uuid.UUID `json:"id"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 	Email     string    `json:"email"`
+	Token     string    `json:"token"`
 }
 
 func main() {
@@ -50,12 +63,14 @@ func main() {
 		log.Fatalf("Error opening database: %s", err)
 	}
 
+	scrt := os.Getenv("SECRET")
 	pltfrm := os.Getenv("PLATFORM")
 	dbQueries := database.New(dbConn)
 	cfg := apiConfig{
 		fileServerHits: atomic.Int32{},
 		db: dbQueries,
 		platform: pltfrm,
+		secret: scrt,
 	}
 
 	mux := http.NewServeMux()
@@ -67,6 +82,7 @@ func main() {
 	mux.HandleFunc("POST /api/chirps", cfg.createChirps)
 	mux.HandleFunc("GET /api/chirps", cfg.getAllChirps)
 	mux.HandleFunc("GET /api/chirps/{chirpID}", cfg.getChirp)
+	mux.HandleFunc("POST /api/login", cfg.login)
 
 	server := http.Server{
 		Addr: ":8080",
@@ -125,10 +141,70 @@ func (cfg *apiConfig) createUsers(w http.ResponseWriter, req *http.Request) {
 		w.WriteHeader(500)
 		w.Write([]byte("{\"error\": \"Something went wrong\"}"))
 	} else {
-		userDb, _ := cfg.db.CreateUser(req.Context(), usr.Email)
-		userRes := user(userDb)
+		hashed_password, _ := auth.HashPassword(usr.Password)
+
+		dbParams := database.CreateUserParams{
+			Email:          usr.Email,
+			HashedPassword: hashed_password,
+		}
+
+		userDb, _ := cfg.db.CreateUser(req.Context(), dbParams)
+
+		userRes := userResponse{
+			ID:        userDb.ID,
+			CreatedAt: userDb.CreatedAt,
+			UpdatedAt: userDb.UpdatedAt,
+			Email:     userDb.Email,
+		}
+		
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(201)
+		res, _ := json.Marshal(userRes)
+		w.Write(res)
+	}
+}
+
+// user login handler: login the user
+func (cfg *apiConfig) login(w http.ResponseWriter, req *http.Request) {
+	decoder := json.NewDecoder(req.Body)
+	usr := user{}
+	err := decoder.Decode(&usr)
+
+	if err != nil {
+		w.WriteHeader(500)
+		w.Write([]byte("{\"error\": \"Something went wrong\"}"))
+	} else {
+		userDb, err := cfg.db.GetUserByEmail(req.Context(), usr.Email)
+		if err != nil {
+			w.WriteHeader(401)
+			w.Write([]byte("Incorrect email"))
+			return
+		}
+		
+		hashed_password := userDb.HashedPassword
+		err = auth.CheckPasswordHash(hashed_password, usr.Password)
+		if err != nil {
+			w.WriteHeader(401)
+			w.Write([]byte("Incorrect password"))
+			return 
+		}
+
+		if usr.ExpiresInSecond == 0 {
+			usr.ExpiresInSecond = 3600
+		}
+
+		token, _ := auth.MakeJWT(userDb.ID, cfg.secret, time.Second * usr.ExpiresInSecond)
+
+		userRes := userResponse{
+			ID:        userDb.ID,
+			CreatedAt: userDb.CreatedAt,
+			UpdatedAt: userDb.UpdatedAt,
+			Email:     userDb.Email,
+			Token:     token,
+		}
+		
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
 		res, _ := json.Marshal(userRes)
 		w.Write(res)
 	}
@@ -143,37 +219,55 @@ func (cfg *apiConfig) createChirps(w http.ResponseWriter, req *http.Request) {
 	if err != nil {
 		w.WriteHeader(500)
 		w.Write([]byte("{\"error\": \"Something went wrong\"}"))
-	} else if len(chrp.Body) > 140 {
+		return 
+	} 
+	
+	token, err := auth.GetBearerToken(req.Header)
+	if err != nil {
+		w.WriteHeader(401)
+		w.Write([]byte("No bearer token is present"))
+		return 
+	} 
+	
+	user_id, err := auth.ValidateJWT(token, cfg.secret)
+	if err != nil {
+		w.WriteHeader(401)
+		w.Write([]byte("Bad credentials"))
+		return
+	}
+
+	if len(chrp.Body) > 140 {
 		w.WriteHeader(400)
 		w.Write([]byte("{\"error\": \"Chirp is too long\"}"))
-	} else {
-		chrp.Body = cleanProfanity(chrp.Body)
+		return
+	} 
 
-		chirpParams := database.CreateChirpParams{
-			Body: chrp.Body,
-			UserID: chrp.UserId,
-		}
+	chrp.Body = cleanProfanity(chrp.Body)
 
-		chirpDb, err := cfg.db.CreateChirp(req.Context(), chirpParams)
-		if err != nil {
-			log.Printf("CreateChirp error: %v", err)
-			http.Error(w, `{"error": "Could not create chirp"}`, http.StatusInternalServerError)
-			return
-		}
+	chirpParams := database.CreateChirpParams{
+		Body: chrp.Body,
+		UserID: user_id,
+	}
+
+	chirpDb, err := cfg.db.CreateChirp(req.Context(), chirpParams)
+	if err != nil {
+		log.Printf("CreateChirp error: %v", err)
+		http.Error(w, `{"error": "Could not create chirp"}`, http.StatusInternalServerError)
+		return
+	}
 	
-		chirpRes := chirp{
-			ID:        chirpDb.ID,
-			CreatedAt: chirpDb.CreatedAt,
-			UpdatedAt: chirpDb.UpdatedAt,
-			Body:      chirpDb.Body,
-			UserId:    chirpDb.UserID, 
-		}
+	chirpRes := chirp{
+		ID:        chirpDb.ID,
+		CreatedAt: chirpDb.CreatedAt,
+		UpdatedAt: chirpDb.UpdatedAt,
+		Body:      chirpDb.Body,
+		UserId:    chirpDb.UserID, 
+	}
 
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(201)
-		res, _ := json.Marshal(chirpRes)
-		w.Write(res)
-	}	
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(201)
+	res, _ := json.Marshal(chirpRes)
+	w.Write(res)	
 }
 
 //helper function for createChirps handler
@@ -247,3 +341,4 @@ func (cfg *apiConfig) getChirp(w http.ResponseWriter, req *http.Request) {
 		w.Write(res)
 	}
 }
+
