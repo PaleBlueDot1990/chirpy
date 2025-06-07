@@ -40,15 +40,19 @@ type user struct {
 	Email           string        `json:"email"`
 	Password        string        `json:"password"`
 	HashedPassword  string        `json:"hashed_password"`
-	ExpiresInSecond time.Duration `json:"expires_in_second"`
 }
 
 type userResponse struct {
-	ID        uuid.UUID `json:"id"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-	Email     string    `json:"email"`
-	Token     string    `json:"token"`
+	ID           uuid.UUID `json:"id"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+	Email        string    `json:"email"`
+	Token        string    `json:"token"`
+	RefreshToken string    `json:"refresh_token"`
+}
+
+type RefreshedAccessToken struct {
+	Token string `json:"token"`
 }
 
 func main() {
@@ -83,6 +87,8 @@ func main() {
 	mux.HandleFunc("GET /api/chirps", cfg.getAllChirps)
 	mux.HandleFunc("GET /api/chirps/{chirpID}", cfg.getChirp)
 	mux.HandleFunc("POST /api/login", cfg.login)
+	mux.HandleFunc("POST /api/refresh", cfg.refreshToken)
+	mux.HandleFunc("POST /api/revoke", cfg.revokeToken)
 
 	server := http.Server{
 		Addr: ":8080",
@@ -189,18 +195,21 @@ func (cfg *apiConfig) login(w http.ResponseWriter, req *http.Request) {
 			return 
 		}
 
-		if usr.ExpiresInSecond == 0 {
-			usr.ExpiresInSecond = 3600
+		refresh_token, _ := auth.MakeRefreshTokens()
+		dbParams := database.CreateRefreshTokensParams{
+			Token: refresh_token,
+			UserID: userDb.ID,
 		}
+		cfg.db.CreateRefreshTokens(req.Context(), dbParams)
 
-		token, _ := auth.MakeJWT(userDb.ID, cfg.secret, time.Second * usr.ExpiresInSecond)
-
+		token, _ := auth.MakeJWT(userDb.ID, cfg.secret, time.Second * 3600)
 		userRes := userResponse{
-			ID:        userDb.ID,
-			CreatedAt: userDb.CreatedAt,
-			UpdatedAt: userDb.UpdatedAt,
-			Email:     userDb.Email,
-			Token:     token,
+			ID:           userDb.ID,
+			CreatedAt:    userDb.CreatedAt,
+			UpdatedAt:    userDb.UpdatedAt,
+			Email:        userDb.Email,
+			Token:        token,
+			RefreshToken: refresh_token,
 		}
 		
 		w.Header().Set("Content-Type", "application/json")
@@ -340,5 +349,73 @@ func (cfg *apiConfig) getChirp(w http.ResponseWriter, req *http.Request) {
 		res, _ := json.Marshal(chrpRes)
 		w.Write(res)
 	}
+}
+
+func (cfg *apiConfig) refreshToken(w http.ResponseWriter, req *http.Request) {
+	refresh_token, err := auth.GetBearerToken(req.Header)
+	if err != nil {
+		w.WriteHeader(401)
+		w.Write([]byte("No refresh token available"))
+		return
+	}
+
+	dbResponse, err := cfg.db.GetUserFromRefreshToken(req.Context(), refresh_token)
+	if err != nil {
+		w.WriteHeader(401)
+		w.Write([]byte("Invalid refresh token"))
+		return
+	}
+
+	if dbResponse.ExpiresAt.Before(time.Now()) {
+		w.WriteHeader(401)
+		w.Write([]byte("Refresh token has expires"))
+		return
+	}
+
+	if dbResponse.ExpiresAt.Before(time.Now()) {
+		w.WriteHeader(401)
+		w.Write([]byte("Refresh token has expires"))
+		return
+	}
+
+	if !dbResponse.RevokedAt.Time.IsZero() {
+		w.WriteHeader(401)
+		w.Write([]byte("Refresh token has been revoked"))
+		return
+	}
+
+	token, err := auth.MakeJWT(dbResponse.UserID, cfg.secret, time.Second * 3600)
+	if err != nil {
+		w.WriteHeader(401)
+		w.Write([]byte("Error creating access token"))
+		return
+	}
+
+	tkn := RefreshedAccessToken{
+		Token: token,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	res, _ := json.Marshal(tkn)
+	w.Write(res)
+}
+
+func (cfg *apiConfig) revokeToken(w http.ResponseWriter, req *http.Request) {
+	refresh_token, err := auth.GetBearerToken(req.Header)
+	if err != nil {
+		w.WriteHeader(401)
+		w.Write([]byte("No refresh token available"))
+		return
+	}
+
+	err = cfg.db.UpdateRefreshTokenRevokeStatus(req.Context(), refresh_token)
+	if err != nil {
+		w.WriteHeader(500)
+		w.Write([]byte("Error updating revoke status of refresh token"))
+		return
+	}
+
+	w.WriteHeader(204)
 }
 
