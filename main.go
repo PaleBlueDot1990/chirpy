@@ -65,6 +65,8 @@ func main() {
 	mux.HandleFunc("POST /admin/reset", cfg.resetMetricsHandler)
 	mux.HandleFunc("POST /api/users", cfg.createUsers)
 	mux.HandleFunc("POST /api/chirps", cfg.createChirps)
+	mux.HandleFunc("GET /api/chirps", cfg.getAllChirps)
+	mux.HandleFunc("GET /api/chirps/{chirpID}", cfg.getChirp)
 
 	server := http.Server{
 		Addr: ":8080",
@@ -174,6 +176,7 @@ func (cfg *apiConfig) createChirps(w http.ResponseWriter, req *http.Request) {
 	}	
 }
 
+//helper function for createChirps handler
 func cleanProfanity(text string) string {
 	if !hasProfanity(text) {
 		return text
@@ -191,6 +194,7 @@ func cleanProfanity(text string) string {
 	return cleaned_chirp[:len(cleaned_chirp)-1]
 }
 
+//helper function for createChirps handler
 func hasProfanity(text string) bool {
 	words := strings.Fields(text)
 	for _, word := range words {
@@ -199,4 +203,47 @@ func hasProfanity(text string) bool {
 		}
 	}
 	return false
+}
+
+// chirp get handler: gets all chirps in the db 
+func (cfg *apiConfig) getAllChirps(w http.ResponseWriter, req *http.Request) {
+	chrpsDb, _ := cfg.db.GetAllChirps(req.Context())
+	var chrpsRes []chirp
+	for _, chrpDb := range chrpsDb {
+		chrpRes := chirp{
+			ID:        chrpDb.ID,
+			CreatedAt: chrpDb.CreatedAt,
+			UpdatedAt: chrpDb.UpdatedAt,
+			Body:      chrpDb.Body,
+			UserId:    chrpDb.UserID,
+		}
+		chrpsRes = append(chrpsRes, chrpRes)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	res, _ := json.Marshal(chrpsRes)
+	w.Write(res)
+}
+
+//chirp get handler: gets the chirp for the given chirp id 
+func (cfg *apiConfig) getChirp(w http.ResponseWriter, req *http.Request) {
+	chrpID, _ := uuid.Parse(req.PathValue("chirpID"))
+	chrpDb, err := cfg.db.GetChirp(req.Context(), chrpID)
+	if err != nil {
+		w.WriteHeader(404)
+		w.Write([]byte("Could not find the chirp"))
+	} else {
+		chrpRes := chirp{
+			ID:        chrpDb.ID,
+			CreatedAt: chrpDb.CreatedAt,
+			UpdatedAt: chrpDb.UpdatedAt,
+			Body:      chrpDb.Body,
+			UserId:    chrpDb.UserID,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		res, _ := json.Marshal(chrpRes)
+		w.Write(res)
+	}
 }
