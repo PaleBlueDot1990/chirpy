@@ -89,6 +89,8 @@ func main() {
 	mux.HandleFunc("POST /api/login", cfg.login)
 	mux.HandleFunc("POST /api/refresh", cfg.refreshToken)
 	mux.HandleFunc("POST /api/revoke", cfg.revokeToken)
+	mux.HandleFunc("PUT /api/users", cfg.updateUsers)
+	mux.HandleFunc("DELETE /api/chirps/{chirpID}", cfg.DeleteChirps)
 
 	server := http.Server{
 		Addr: ":8080",
@@ -351,6 +353,7 @@ func (cfg *apiConfig) getChirp(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
+//refresh token handler: refreshes the jwt access token 
 func (cfg *apiConfig) refreshToken(w http.ResponseWriter, req *http.Request) {
 	refresh_token, err := auth.GetBearerToken(req.Header)
 	if err != nil {
@@ -401,6 +404,7 @@ func (cfg *apiConfig) refreshToken(w http.ResponseWriter, req *http.Request) {
 	w.Write(res)
 }
 
+//revoke token handler: revokes the refresh token 
 func (cfg *apiConfig) revokeToken(w http.ResponseWriter, req *http.Request) {
 	refresh_token, err := auth.GetBearerToken(req.Header)
 	if err != nil {
@@ -418,4 +422,119 @@ func (cfg *apiConfig) revokeToken(w http.ResponseWriter, req *http.Request) {
 
 	w.WriteHeader(204)
 }
+
+//update users handler: updates the email and password of users
+func (cfg *apiConfig) updateUsers(w http.ResponseWriter, req *http.Request) {
+	decoder := json.NewDecoder(req.Body)
+	usr := user{}
+	err := decoder.Decode(&usr)
+	if err != nil {
+		w.WriteHeader(500)
+		w.Write([]byte("{\"error\": \"Something went wrong\"}"))
+		return 
+	}
+
+	token, err := auth.GetBearerToken(req.Header)
+	if err != nil {
+		w.WriteHeader(401)
+		w.Write([]byte("Bad credentials"))
+		return 
+	}
+
+	user_id, err := auth.ValidateJWT(token, cfg.secret)
+	if err != nil {
+		w.WriteHeader(401)
+		w.Write([]byte("Bad credentials"))
+		return
+	}
+
+	updated_email := usr.Email
+	updated_password := usr.Password
+	updated_hashed_password, err := auth.HashPassword(updated_password)
+	if err != nil {
+		w.WriteHeader(500)
+		w.Write([]byte("{\"error\": \"Something went wrong\"}"))
+		return 
+	}
+
+	dbParams := database.UpdateUserEmailAndPasswordParams{
+		Email: updated_email,
+		HashedPassword: updated_hashed_password,
+		ID: user_id,
+	}
+
+	err = cfg.db.UpdateUserEmailAndPassword(req.Context(), dbParams)
+	if err != nil {
+		w.WriteHeader(500)
+		w.Write([]byte("{\"error\": \"Something went wrong\"}"))
+		return 
+	}
+
+	usrDb, err := cfg.db.GetUserById(req.Context(), user_id)
+	if err != nil {
+		w.WriteHeader(500)
+		w.Write([]byte("{\"error\": \"Something went wrong\"}"))
+		return 
+	}
+
+	userRes := userResponse{
+		ID: usrDb.ID,
+		CreatedAt: usrDb.CreatedAt,
+		UpdatedAt: usrDb.UpdatedAt,
+		Email: usrDb.Email,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	res, _ := json.Marshal(userRes)
+	w.Write(res)
+}
+
+//delete chirps handler: deletes a chirp 
+func (cfg *apiConfig) DeleteChirps(w http.ResponseWriter, req *http.Request) {
+	token, err := auth.GetBearerToken(req.Header)
+	if err != nil {
+		w.WriteHeader(401)
+		w.Write([]byte("Bad credentials!"))
+		return 
+	}
+
+	user_id, err := auth.ValidateJWT(token, cfg.secret)
+	if err != nil {
+		w.WriteHeader(401)
+		w.Write([]byte("Bad credentials!"))
+		return 
+	}
+
+	chrpID, err := uuid.Parse(req.PathValue("chirpID"))
+	if err != nil {
+		w.WriteHeader(500)
+		w.Write([]byte("Something went wrong"))
+		return 
+	}
+
+	chrpDb, err := cfg.db.GetChirp(req.Context(), chrpID)
+	if err != nil {
+		w.WriteHeader(404)
+		w.Write([]byte("Chirp not found"))
+		return 
+	}
+
+	if user_id != chrpDb.UserID {
+		w.WriteHeader(403)
+		w.Write([]byte("Chirp not found"))
+		return 
+	}
+
+	err = cfg.db.DeleteChirp(req.Context(), chrpID)
+    if err != nil {
+		w.WriteHeader(500)
+		w.Write([]byte("Something went wrong"))
+		return 
+	}
+
+	w.WriteHeader(204)
+	w.Write([]byte("Chirp deleted successfully!"))
+}
+
 
