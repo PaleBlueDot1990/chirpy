@@ -1,6 +1,7 @@
 package main
 
 import (
+	"chirpy/internal/auth"
 	"chirpy/internal/database"
 	"database/sql"
 	"encoding/json"
@@ -8,10 +9,10 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"time"
-	"chirpy/internal/auth"
 
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
@@ -23,6 +24,7 @@ type apiConfig struct{
 	db *database.Queries
 	platform string
 	secret string
+	polka_key string
 }
 
 type chirp struct {
@@ -49,10 +51,20 @@ type userResponse struct {
 	Email        string    `json:"email"`
 	Token        string    `json:"token"`
 	RefreshToken string    `json:"refresh_token"`
+	IsChirpyRed  bool      `json:"is_chirpy_red"`
 }
 
 type RefreshedAccessToken struct {
 	Token string `json:"token"`
+}
+
+type UserUpgradedEvent struct {
+	Event string         `json:"event"`
+	Data  UserUpgradeData `json:"data"`
+}
+
+type UserUpgradeData struct {
+	UserID string `json:"user_id"`
 }
 
 func main() {
@@ -70,11 +82,13 @@ func main() {
 	scrt := os.Getenv("SECRET")
 	pltfrm := os.Getenv("PLATFORM")
 	dbQueries := database.New(dbConn)
+	pkey := os.Getenv("POLKA_KEY")
 	cfg := apiConfig{
 		fileServerHits: atomic.Int32{},
 		db: dbQueries,
 		platform: pltfrm,
 		secret: scrt,
+		polka_key: pkey,
 	}
 
 	mux := http.NewServeMux()
@@ -91,6 +105,7 @@ func main() {
 	mux.HandleFunc("POST /api/revoke", cfg.revokeToken)
 	mux.HandleFunc("PUT /api/users", cfg.updateUsers)
 	mux.HandleFunc("DELETE /api/chirps/{chirpID}", cfg.DeleteChirps)
+	mux.HandleFunc("POST /api/polka/webhooks", cfg.UpgradeUsersToChirpyRed)
 
 	server := http.Server{
 		Addr: ":8080",
@@ -159,10 +174,11 @@ func (cfg *apiConfig) createUsers(w http.ResponseWriter, req *http.Request) {
 		userDb, _ := cfg.db.CreateUser(req.Context(), dbParams)
 
 		userRes := userResponse{
-			ID:        userDb.ID,
-			CreatedAt: userDb.CreatedAt,
-			UpdatedAt: userDb.UpdatedAt,
-			Email:     userDb.Email,
+			ID:          userDb.ID,
+			CreatedAt:   userDb.CreatedAt,
+			UpdatedAt:   userDb.UpdatedAt,
+			Email:       userDb.Email,
+			IsChirpyRed: userDb.IsChirpyRed,
 		}
 		
 		w.Header().Set("Content-Type", "application/json")
@@ -212,6 +228,7 @@ func (cfg *apiConfig) login(w http.ResponseWriter, req *http.Request) {
 			Email:        userDb.Email,
 			Token:        token,
 			RefreshToken: refresh_token,
+			IsChirpyRed:  userDb.IsChirpyRed,
 		}
 		
 		w.Header().Set("Content-Type", "application/json")
@@ -312,7 +329,25 @@ func hasProfanity(text string) bool {
 
 // chirp get handler: gets all chirps in the db 
 func (cfg *apiConfig) getAllChirps(w http.ResponseWriter, req *http.Request) {
-	chrpsDb, _ := cfg.db.GetAllChirps(req.Context())
+	author_id := req.URL.Query().Get("author_id")
+	var user_id uuid.UUID
+	var err error = nil 
+	if author_id != "" {
+		user_id, err = uuid.Parse(author_id)
+		if err != nil {
+			w.WriteHeader(500)
+			w.Write([]byte("Something went wrong"))
+			return 
+		}
+	}
+	
+	var chrpsDb []database.Chirp
+	if author_id == "" {
+		chrpsDb, _ = cfg.db.GetAllChirps(req.Context());
+	} else {
+		chrpsDb, _ = cfg.db.GetChirpsOfAuthor(req.Context(), user_id)
+	}
+
 	var chrpsRes []chirp
 	for _, chrpDb := range chrpsDb {
 		chrpRes := chirp{
@@ -323,6 +358,11 @@ func (cfg *apiConfig) getAllChirps(w http.ResponseWriter, req *http.Request) {
 			UserId:    chrpDb.UserID,
 		}
 		chrpsRes = append(chrpsRes, chrpRes)
+	}
+
+	order := req.URL.Query().Get("sort")
+	if order == "desc" {
+		slices.Reverse(chrpsRes)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -482,6 +522,7 @@ func (cfg *apiConfig) updateUsers(w http.ResponseWriter, req *http.Request) {
 		CreatedAt: usrDb.CreatedAt,
 		UpdatedAt: usrDb.UpdatedAt,
 		Email: usrDb.Email,
+		IsChirpyRed: usrDb.IsChirpyRed,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -537,4 +578,51 @@ func (cfg *apiConfig) DeleteChirps(w http.ResponseWriter, req *http.Request) {
 	w.Write([]byte("Chirp deleted successfully!"))
 }
 
+//updgrade handler: upgrades a user to chirpy red 
+func (cfg *apiConfig) UpgradeUsersToChirpyRed(w http.ResponseWriter, req *http.Request) {
+	decoder := json.NewDecoder(req.Body)
+	userUpgradedEvent := UserUpgradedEvent{}
+	err := decoder.Decode(&userUpgradedEvent)
+	if err != nil {
+		w.WriteHeader(500)
+		w.Write([]byte("Something went wrong"))
+		return 
+	}
+
+	pkey, err := auth.GetPolkaApiKey(req.Header)
+	if err != nil || pkey != cfg.polka_key {
+		w.WriteHeader(401)
+		w.Write([]byte("Bad credentials"))
+		return 
+	}
+
+	event := userUpgradedEvent.Event
+	if event != "user.upgraded" {
+		w.WriteHeader(204)
+		return
+	}
+
+	user_id, err := uuid.Parse(userUpgradedEvent.Data.UserID)
+	if err != nil {
+		w.WriteHeader(500)
+		w.Write([]byte("Something went wrong"))
+		return 
+	}
+
+	_, err = cfg.db.GetUserById(req.Context(), user_id)
+	if err != nil {
+		w.WriteHeader(404)
+		w.Write([]byte("User not found"))
+		return 
+	}
+
+	err = cfg.db.UpgradeUserToChirpyRed(req.Context(), user_id)
+    if err != nil {
+		w.WriteHeader(500)
+		w.Write([]byte("Something went wrong"))
+		return 
+	}
+
+	w.WriteHeader(204)
+}
 
